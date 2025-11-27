@@ -1416,33 +1416,52 @@ resources:
     HttpApiUrl:
       Description: URL del HTTP API Gateway
       Value:
-        Fn::Sub: "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+        Fn::Join:
+          - ''
+          - - 'https://'
+            - Ref: HttpApi
+            - '.execute-api.'
+            - Ref: AWS::Region
+            - '.amazonaws.com'
     
     WebSocketApiUrl:
       Description: URL del WebSocket API
       Value:
-        Fn::Sub: "wss://${WebsocketsApi}.execute-api.${AWS::Region}.amazonaws.com/${sls:stage}"
+        Fn::Join:
+          - ''
+          - - 'wss://'
+            - Ref: WebsocketsApi
+            - '.execute-api.'
+            - Ref: AWS::Region
+            - '.amazonaws.com/'
+            - ${self:provider.stage}
     
     OrderWorkflowArn:
       Description: ARN de la Step Function de órdenes
-      Value: !Ref OrderWorkflow
+      Value:
+        Ref: OrderWorkflow
     
     EventBusName:
       Description: Nombre del Event Bus
-      Value: !Ref OrdersEventBus
+      Value:
+        Ref: OrdersEventBus
     
     MediaBucketName:
       Description: Nombre del bucket S3 para media
-      Value: !Ref MediaBucket
+      Value:
+        Ref: MediaBucket
     
     OrdersTableName:
       Description: Nombre de la tabla de órdenes
-      Value: !Ref OrdersTable
+      Value:
+        Ref: OrdersTable
     
     NotificationsTopicArn:
       Description: ARN del SNS Topic para notificaciones
-      Value: !Ref OrderNotificationsTopic
+      Value:
+        Ref: OrderNotificationsTopic
     
     AlarmsTopicArn:
       Description: ARN del SNS Topic para alarmas
-      Value: !Ref OrderFailureAlarmTopic
+      Value:
+        Ref: OrderFailureAlarmTopic
