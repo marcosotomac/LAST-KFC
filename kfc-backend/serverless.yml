@@ -1,6 +1,9 @@
 org: marcosotomac
 service: kfc-orders-cloud
 
+plugins:
+  - serverless-python-requirements
+
 provider:
   name: aws
   stage: ${opt:stage, 'dev'}
@@ -383,6 +386,15 @@ package:
 custom:
   # Owner del proyecto
   owner: marcos-soto
+  
+  # Configuración para empaquetar dependencias de Python
+  pythonRequirements:
+    slim: true
+    zip: true
+    layer: false
+    dockerizePip: false
+    useStaticCache: false
+    useDownloadCache: false
   
   # Sufijo opcional para evitar colisiones con stacks previos
   nameSuffix: ${param:suffix, 'v7'}
