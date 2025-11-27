@@ -1,0 +1,1451 @@
+org: marcosotomac
+service: kfc-orders-cloud
+
+plugins:
+  - serverless-plugin-tracing
+
+provider:
+  name: aws
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+  stackName: ${self:service}-${sls:stage}-${self:custom.nameSuffix}
+  runtime: python3.11
+  # Configuración de memoria y timeout base - se puede override por función
+  memorySize: 1024
+  timeout: 30
+  
+  # Logs estructurados con retention
+  logs:
+    restApi: true
+    httpApi: true
+  logRetentionInDays: 14
+  
+  # X-Ray tracing para todas las funciones
+  tracing:
+    lambda: true
+    apiGateway: true
+  
+  # WebSocket API configuration
+  websocketsApiName: ${self:service}-ws-${sls:stage}-${self:custom.nameSuffix}
+  websocketsApiRouteSelectionExpression: $request.body.action
+  
+  # HTTP API con CORS y configuraciones avanzadas
+  httpApi:
+    cors:
+      allowedOrigins:
+        - "*"
+      allowedHeaders:
+        - Content-Type
+        - Authorization
+        - X-Requested-With
+        - x-tenant-id
+        - x-user-id
+        - x-role
+      allowedMethods:
+        - OPTIONS
+        - GET
+        - POST
+        - PATCH
+        - PUT
+        - DELETE
+      maxAge: 300
+    # Throttling para protección
+    throttle:
+      rateLimit: ${self:custom.apiThrottling.${sls:stage}.rateLimit}
+      burstLimit: ${self:custom.apiThrottling.${sls:stage}.burstLimit}
+  
+  # Variables de entorno compartidas por todas las funciones
+  environment:
+    STAGE: ${sls:stage}
+    SERVICE_NAME: ${self:service}
+    LOG_LEVEL: ${self:custom.logLevel.${sls:stage}}
+    TENANTS_TABLE: ${self:custom.tenantsTableName}
+    ORDERS_TABLE: ${self:custom.ordersTableName}
+    CONNECTIONS_TABLE: ${self:custom.connectionsTableName}
+    USERS_TABLE: ${self:custom.usersTableName}
+    PRODUCTS_TABLE: ${self:custom.productsTableName}
+    MEDIA_BUCKET_NAME: ${self:custom.mediaBucketName}
+    EVENT_BUS_NAME: ${self:custom.eventBusName}
+    NOTIFICATIONS_TOPIC_ARN:
+      Ref: OrderNotificationsTopic
+    ORDER_WORKFLOW_ARN:
+      Ref: OrderWorkflow
+    KITCHEN_QUEUE_URL:
+      Ref: KitchenQueue
+    PACKAGING_QUEUE_URL:
+      Ref: PackagingQueue
+    DELIVERY_QUEUE_URL:
+      Ref: DeliveryQueue
+    CONNECTION_TTL_SECONDS: ${opt:connectionTtl, env:CONNECTION_TTL_SECONDS, '3600'}
+    WEBSOCKET_API_ENDPOINT:
+      Fn::Join:
+        - ""
+        - - "https://"
+          - Ref: WebsocketsApi
+          - ".execute-api."
+          - ${self:provider.region}
+          - ".amazonaws.com/"
+          - ${self:provider.stage}
+    # CloudWatch Metrics
+    ENABLE_METRICS: ${self:custom.enableMetrics.${sls:stage}}
+    POWERTOOLS_SERVICE_NAME: ${self:service}
+    POWERTOOLS_METRICS_NAMESPACE: KFC/Orders
+  
+  # IAM Role - En producción se debería crear un role específico
+  iam:
+    role: arn:aws:iam::967418674262:role/LabRole
+  
+  # Tags globales para todos los recursos
+  tags:
+    Environment: ${sls:stage}
+    Service: ${self:service}
+    ManagedBy: ServerlessFramework
+    Project: KFC
+    CostCenter: KFC-OrderManagement
+    Owner: ${self:custom.owner}
+
+# ============================================
+# FUNCIONES LAMBDA
+# ============================================
+functions:
+  # ==================== TENANTS ====================
+  registerTenant:
+    handler: src/handlers/tenants/register.handler
+    description: Alta de tenants (franquicias KFC) para el esquema multi-tenant
+    timeout: 10
+    memorySize: 512
+    reservedConcurrency: ${self:custom.reservedConcurrency.${sls:stage}.standard}
+    events:
+      - httpApi:
+          method: post
+          path: /tenants
+    environment:
+      FUNCTION_NAME: registerTenant
+    tags:
+      FunctionType: TenantManagement
+  
+  # ==================== ORDERS ====================
+  createOrder:
+    handler: src/handlers/orders/create_order.handler
+    description: Crea un pedido y dispara eventos al bus para iniciar el workflow
+    timeout: 15
+    memorySize: 1024
+    reservedConcurrency: ${self:custom.reservedConcurrency.${sls:stage}.critical}
+    events:
+      - httpApi:
+          method: post
+          path: /tenants/{tenantId}/orders
+    environment:
+      FUNCTION_NAME: createOrder
+    tags:
+      FunctionType: OrderProcessing
+      Critical: "true"
+  
+  listOrders:
+    handler: src/handlers/orders/list_orders.handler
+    description: Lista pedidos por tenant con filtro opcional por estado
+    timeout: 15
+    memorySize: 512
+    events:
+      - httpApi:
+          method: get
+          path: /tenants/{tenantId}/orders
+    environment:
+      FUNCTION_NAME: listOrders
+    tags:
+      FunctionType: OrderQuery
+  
+  getOrder:
+    handler: src/handlers/orders/get_order.handler
+    description: Devuelve el estado y trazabilidad de un pedido específico
+    timeout: 10
+    memorySize: 512
+    events:
+      - httpApi:
+          method: get
+          path: /tenants/{tenantId}/orders/{orderId}
+    environment:
+      FUNCTION_NAME: getOrder
+    tags:
+      FunctionType: OrderQuery
+  
+  completeStage:
+    handler: src/handlers/orders/complete_stage.handler
+    description: Marca una etapa del workflow como completada y responde a Step Functions
+    timeout: 10
+    memorySize: 512
+    reservedConcurrency: ${self:custom.reservedConcurrency.${sls:stage}.standard}
+    events:
+      - httpApi:
+          method: post
+          path: /tenants/{tenantId}/orders/{orderId}/stages/{stage}/complete
+    environment:
+      FUNCTION_NAME: completeStage
+    tags:
+      FunctionType: WorkflowManagement
+  
+  # ==================== EVENTS ====================
+  orderEventsRouter:
+    handler: src/handlers/events/router.handler
+    description: Empuja eventos del bus a WebSockets y SNS
+    timeout: 10
+    memorySize: 512
+    reservedConcurrency: ${self:custom.reservedConcurrency.${sls:stage}.standard}
+    events:
+      - eventBridge:
+          eventBus:
+            Fn::GetAtt:
+              - OrdersEventBus
+              - Name
+          pattern:
+            source:
+              - kfc.orders
+    environment:
+      FUNCTION_NAME: orderEventsRouter
+    tags:
+      FunctionType: EventProcessing
+  
+  # ==================== WEBSOCKETS ====================
+  wsConnect:
+    handler: src/handlers/ws/connect.handler
+    description: Registra conexiones WebSocket asociadas a un tenant y rol
+    timeout: 10
+    memorySize: 256
+    events:
+      - websocket: $connect
+    environment:
+      FUNCTION_NAME: wsConnect
+    tags:
+      FunctionType: WebSocket
+  
+  wsDisconnect:
+    handler: src/handlers/ws/disconnect.handler
+    description: Limpia conexiones WebSocket al desconectar
+    timeout: 10
+    memorySize: 256
+    events:
+      - websocket: $disconnect
+    environment:
+      FUNCTION_NAME: wsDisconnect
+    tags:
+      FunctionType: WebSocket
+  
+  wsDefault:
+    handler: src/handlers/ws/default.handler
+    description: Maneja mensajes no soportados
+    timeout: 5
+    memorySize: 256
+    events:
+      - websocket: $default
+    environment:
+      FUNCTION_NAME: wsDefault
+    tags:
+      FunctionType: WebSocket
+  
+  wsPing:
+    handler: src/handlers/ws/ping.handler
+    description: Renueva TTL de conexiones activas
+    timeout: 5
+    memorySize: 256
+    events:
+      - websocket: ping
+    environment:
+      FUNCTION_NAME: wsPing
+    tags:
+      FunctionType: WebSocket
+  
+  # ==================== WORKFLOW WORKERS ====================
+  kitchenWorker:
+    handler: src/handlers/workflow/kitchen_worker.handler
+    description: Microservicio cocina - toma pedidos desde SQS y responde a Step Functions
+    timeout: 30
+    memorySize: 512
+    reservedConcurrency: ${self:custom.reservedConcurrency.${sls:stage}.worker}
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt: [KitchenQueue, Arn]
+          batchSize: 1
+          maximumBatchingWindowInSeconds: 0
+    environment:
+      FUNCTION_NAME: kitchenWorker
+      WORKER_TYPE: kitchen
+    tags:
+      FunctionType: WorkflowWorker
+      WorkerStage: Kitchen
+  
+  packagingWorker:
+    handler: src/handlers/workflow/packaging_worker.handler
+    description: Microservicio empaque - procesa pedidos preparados
+    timeout: 30
+    memorySize: 512
+    reservedConcurrency: ${self:custom.reservedConcurrency.${sls:stage}.worker}
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt: [PackagingQueue, Arn]
+          batchSize: 1
+          maximumBatchingWindowInSeconds: 0
+    environment:
+      FUNCTION_NAME: packagingWorker
+      WORKER_TYPE: packaging
+    tags:
+      FunctionType: WorkflowWorker
+      WorkerStage: Packaging
+  
+  deliveryWorker:
+    handler: src/handlers/workflow/delivery_worker.handler
+    description: Microservicio delivery - marca pedidos como entregados
+    timeout: 30
+    memorySize: 512
+    reservedConcurrency: ${self:custom.reservedConcurrency.${sls:stage}.worker}
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt: [DeliveryQueue, Arn]
+          batchSize: 1
+          maximumBatchingWindowInSeconds: 0
+    environment:
+      FUNCTION_NAME: deliveryWorker
+      WORKER_TYPE: delivery
+    tags:
+      FunctionType: WorkflowWorker
+      WorkerStage: Delivery
+  
+  # ==================== PRODUCTS ====================
+  createProduct:
+    handler: src/handlers/products/create_product.handler
+    description: Alta de productos por tenant
+    timeout: 10
+    memorySize: 512
+    events:
+      - httpApi:
+          method: post
+          path: /tenants/{tenantId}/products
+    environment:
+      FUNCTION_NAME: createProduct
+    tags:
+      FunctionType: ProductManagement
+  
+  listProducts:
+    handler: src/handlers/products/list_products.handler
+    description: Lista productos de un tenant
+    timeout: 10
+    memorySize: 512
+    events:
+      - httpApi:
+          method: get
+          path: /tenants/{tenantId}/products
+    environment:
+      FUNCTION_NAME: listProducts
+    tags:
+      FunctionType: ProductQuery
+  
+  # ==================== AUTHENTICATION ====================
+  registerUser:
+    handler: src/handlers/auth/register_user.handler
+    description: Registro de usuario para tenant
+    timeout: 10
+    memorySize: 512
+    events:
+      - httpApi:
+          method: post
+          path: /tenants/{tenantId}/auth/register
+    environment:
+      FUNCTION_NAME: registerUser
+    tags:
+      FunctionType: Authentication
+  
+  login:
+    handler: src/handlers/auth/login.handler
+    description: Login simple para tenant
+    timeout: 10
+    memorySize: 512
+    events:
+      - httpApi:
+          method: post
+          path: /tenants/{tenantId}/auth/login
+    environment:
+      FUNCTION_NAME: login
+    tags:
+      FunctionType: Authentication
+
+# ============================================
+# PACKAGE CONFIGURATION
+# ============================================
+package:
+  patterns:
+    - "!node_modules/**"
+    - "!venv/**"
+    - "!front-hack-cloud/**"
+    - "!.git/**"
+    - "!*.pdf"
+    - "!*.md"
+    - "!tests/**"
+    - "!.pytest_cache/**"
+    - "!__pycache__/**"
+
+# ============================================
+# CUSTOM VARIABLES
+# ============================================
+custom:
+  # Owner del proyecto
+  owner: marcos-soto
+  
+  # Sufijo opcional para evitar colisiones con stacks previos
+  nameSuffix: ${param:suffix, 'v5'}
+  
+  # Table names
+  tenantsTableName: ${self:service}-tenants-${sls:stage}-${self:custom.nameSuffix}
+  ordersTableName: ${self:service}-orders-${sls:stage}-${self:custom.nameSuffix}
+  connectionsTableName: ${self:service}-connections-${sls:stage}-${self:custom.nameSuffix}
+  usersTableName: ${self:service}-users-${sls:stage}-${self:custom.nameSuffix}
+  productsTableName: ${self:service}-products-${sls:stage}-${self:custom.nameSuffix}
+  
+  # S3 bucket
+  mediaBucketSuffix: ${param:bucketSuffix, 'r1'}
+  mediaBucketName: ${self:service}-media-${sls:stage}-${self:custom.nameSuffix}-${self:custom.mediaBucketSuffix}
+  
+  # EventBridge
+  eventBusName: ${self:service}-bus-${sls:stage}-${self:custom.nameSuffix}
+  
+  # Log level por stage
+  logLevel:
+    dev: DEBUG
+    staging: INFO
+    prod: WARNING
+  
+  # Métricas habilitadas por stage
+  enableMetrics:
+    dev: "false"
+    staging: "true"
+    prod: "true"
+  
+  # API Throttling por stage
+  apiThrottling:
+    dev:
+      rateLimit: 1000
+      burstLimit: 2000
+    staging:
+      rateLimit: 5000
+      burstLimit: 10000
+    prod:
+      rateLimit: 10000
+      burstLimit: 20000
+  
+  # Reserved concurrency por stage
+  reservedConcurrency:
+    dev:
+      critical: 5
+      standard: 3
+      worker: 2
+    staging:
+      critical: 20
+      standard: 10
+      worker: 5
+    prod:
+      critical: 100
+      standard: 50
+      worker: 25
+  
+  # Alarmas habilitadas por stage
+  alarmsEnabled:
+    dev: false
+    staging: true
+    prod: true
+
+# ============================================
+# RECURSOS AWS
+# ============================================
+resources:
+  Resources:
+    # ==================== DYNAMODB TABLES ====================
+    TenantsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.tenantsTableName}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: tenantId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenantId
+            KeyType: HASH
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Table
+            Value: Tenants
+    
+    OrdersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.ordersTableName}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: tenantId
+            AttributeType: S
+          - AttributeName: orderId
+            AttributeType: S
+          - AttributeName: status
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenantId
+            KeyType: HASH
+          - AttributeName: orderId
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: status-index
+            KeySchema:
+              - AttributeName: tenantId
+                KeyType: HASH
+              - AttributeName: status
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+          - IndexName: tenant-created-index
+            KeySchema:
+              - AttributeName: tenantId
+                KeyType: HASH
+              - AttributeName: createdAt
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+        StreamSpecification:
+          StreamViewType: NEW_AND_OLD_IMAGES
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Table
+            Value: Orders
+    
+    ConnectionsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.connectionsTableName}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: tenantId
+            AttributeType: S
+          - AttributeName: connectionId
+            AttributeType: S
+          - AttributeName: role
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenantId
+            KeyType: HASH
+          - AttributeName: connectionId
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: tenant-role-index
+            KeySchema:
+              - AttributeName: tenantId
+                KeyType: HASH
+              - AttributeName: role
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+          - IndexName: connection-index
+            KeySchema:
+              - AttributeName: connectionId
+                KeyType: HASH
+              - AttributeName: tenantId
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        TimeToLiveSpecification:
+          AttributeName: expiresAt
+          Enabled: true
+        SSESpecification:
+          SSEEnabled: true
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Table
+            Value: Connections
+    
+    UsersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.usersTableName}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: tenantId
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: email
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenantId
+            KeyType: HASH
+          - AttributeName: userId
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: tenant-email-index
+            KeySchema:
+              - AttributeName: tenantId
+                KeyType: HASH
+              - AttributeName: email
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Table
+            Value: Users
+    
+    ProductsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:custom.productsTableName}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: tenantId
+            AttributeType: S
+          - AttributeName: productId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: tenantId
+            KeyType: HASH
+          - AttributeName: productId
+            KeyType: RANGE
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Table
+            Value: Products
+    
+    # ==================== S3 BUCKET ====================
+    MediaBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.mediaBucketName}
+        VersioningConfiguration:
+          Status: Enabled
+        LifecycleConfiguration:
+          Rules:
+            - Id: DeleteOldVersions
+              Status: Enabled
+              NoncurrentVersionExpirationInDays: 30
+            - Id: TransitionToIA
+              Status: Enabled
+              Transitions:
+                - StorageClass: STANDARD_IA
+                  TransitionInDays: 90
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders: ["*"]
+              AllowedMethods: ["GET", "PUT", "POST", "DELETE", "HEAD"]
+              AllowedOrigins: ["*"]
+              MaxAge: 3000
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: MediaStorage
+    
+    # ==================== EVENTBRIDGE ====================
+    OrdersEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:custom.eventBusName}
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: EventBus
+    
+    # EventBridge Rules - Ciclo de vida completo
+    StartWorkflowRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-start-workflow-${sls:stage}-${self:custom.nameSuffix}
+        Description: Inicia el workflow cuando se crea una orden
+        EventBusName: !Ref OrdersEventBus
+        EventPattern:
+          source:
+            - kfc.orders
+          detail-type:
+            - order.created
+        State: ENABLED
+        Targets:
+          - Arn: !GetAtt OrderWorkflow.Arn
+            Id: StartOrderWorkflow
+            RoleArn: arn:aws:iam::967418674262:role/LabRole
+            InputPath: "$.detail"
+    
+    KitchenStartedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-kitchen-started-${sls:stage}-${self:custom.nameSuffix}
+        Description: Notifica cuando la cocina comienza a procesar
+        EventBusName: !Ref OrdersEventBus
+        EventPattern:
+          source:
+            - kfc.orders
+          detail-type:
+            - order.kitchen.started
+        State: ENABLED
+        Targets:
+          - Arn: !Ref OrderNotificationsTopic
+            Id: NotifyKitchenStarted
+    
+    KitchenCompletedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-kitchen-completed-${sls:stage}-${self:custom.nameSuffix}
+        Description: Notifica cuando la cocina completa el pedido
+        EventBusName: !Ref OrdersEventBus
+        EventPattern:
+          source:
+            - kfc.orders
+          detail-type:
+            - order.kitchen.completed
+        State: ENABLED
+        Targets:
+          - Arn: !Ref OrderNotificationsTopic
+            Id: NotifyKitchenCompleted
+    
+    PackagingStartedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-packaging-started-${sls:stage}-${self:custom.nameSuffix}
+        Description: Notifica cuando empaque comienza
+        EventBusName: !Ref OrdersEventBus
+        EventPattern:
+          source:
+            - kfc.orders
+          detail-type:
+            - order.packaging.started
+        State: ENABLED
+        Targets:
+          - Arn: !Ref OrderNotificationsTopic
+            Id: NotifyPackagingStarted
+    
+    PackagingCompletedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-packaging-completed-${sls:stage}-${self:custom.nameSuffix}
+        Description: Notifica cuando empaque completa
+        EventBusName: !Ref OrdersEventBus
+        EventPattern:
+          source:
+            - kfc.orders
+          detail-type:
+            - order.packaging.completed
+        State: ENABLED
+        Targets:
+          - Arn: !Ref OrderNotificationsTopic
+            Id: NotifyPackagingCompleted
+    
+    DeliveryStartedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-delivery-started-${sls:stage}-${self:custom.nameSuffix}
+        Description: Notifica cuando delivery comienza
+        EventBusName: !Ref OrdersEventBus
+        EventPattern:
+          source:
+            - kfc.orders
+          detail-type:
+            - order.delivery.started
+        State: ENABLED
+        Targets:
+          - Arn: !Ref OrderNotificationsTopic
+            Id: NotifyDeliveryStarted
+    
+    OrderDeliveredRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-order-delivered-${sls:stage}-${self:custom.nameSuffix}
+        Description: Notifica cuando el pedido es entregado
+        EventBusName: !Ref OrdersEventBus
+        EventPattern:
+          source:
+            - kfc.orders
+          detail-type:
+            - order.delivered
+        State: ENABLED
+        Targets:
+          - Arn: !Ref OrderNotificationsTopic
+            Id: NotifyOrderDelivered
+    
+    OrderFailedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-order-failed-${sls:stage}-${self:custom.nameSuffix}
+        Description: Alerta cuando un pedido falla
+        EventBusName: !Ref OrdersEventBus
+        EventPattern:
+          source:
+            - kfc.orders
+          detail-type:
+            - order.failed
+        State: ENABLED
+        Targets:
+          - Arn: !Ref OrderNotificationsTopic
+            Id: AlertOrderFailed
+          - Arn: !Ref OrderFailureAlarmTopic
+            Id: AlarmOrderFailed
+    
+    # ==================== SNS TOPICS ====================
+    OrderNotificationsTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-notifications-${sls:stage}-${self:custom.nameSuffix}
+        DisplayName: KFC Order Notifications
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: NotificationTopic
+    
+    OrderFailureAlarmTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-alarms-${sls:stage}-${self:custom.nameSuffix}
+        DisplayName: KFC Order Alarms
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: AlarmTopic
+    
+    # ==================== SQS QUEUES ====================
+    # Kitchen Queue con DLQ
+    KitchenDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-kitchen-dlq-${sls:stage}-${self:custom.nameSuffix}
+        MessageRetentionPeriod: 1209600  # 14 días
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: DLQ
+    
+    KitchenQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-kitchen-${sls:stage}-${self:custom.nameSuffix}
+        VisibilityTimeout: 120
+        MessageRetentionPeriod: 345600  # 4 días
+        ReceiveMessageWaitTimeSeconds: 20  # Long polling
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt KitchenDLQ.Arn
+          maxReceiveCount: 3
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: WorkQueue
+          - Key: Stage
+            Value: Kitchen
+    
+    # Packaging Queue con DLQ
+    PackagingDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-packaging-dlq-${sls:stage}-${self:custom.nameSuffix}
+        MessageRetentionPeriod: 1209600  # 14 días
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: DLQ
+    
+    PackagingQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-packaging-${sls:stage}-${self:custom.nameSuffix}
+        VisibilityTimeout: 120
+        MessageRetentionPeriod: 345600  # 4 días
+        ReceiveMessageWaitTimeSeconds: 20  # Long polling
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt PackagingDLQ.Arn
+          maxReceiveCount: 3
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: WorkQueue
+          - Key: Stage
+            Value: Packaging
+    
+    # Delivery Queue con DLQ
+    DeliveryDLQ:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-delivery-dlq-${sls:stage}-${self:custom.nameSuffix}
+        MessageRetentionPeriod: 1209600  # 14 días
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: DLQ
+    
+    DeliveryQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-delivery-${sls:stage}-${self:custom.nameSuffix}
+        VisibilityTimeout: 120
+        MessageRetentionPeriod: 345600  # 4 días
+        ReceiveMessageWaitTimeSeconds: 20  # Long polling
+        RedrivePolicy:
+          deadLetterTargetArn: !GetAtt DeliveryDLQ.Arn
+          maxReceiveCount: 3
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: WorkQueue
+          - Key: Stage
+            Value: Delivery
+    
+    # ==================== STEP FUNCTIONS ====================
+    OrderWorkflow:
+      Type: AWS::StepFunctions::StateMachine
+      Properties:
+        StateMachineName: ${self:service}-workflow-${sls:stage}-${self:custom.nameSuffix}
+        RoleArn: arn:aws:iam::967418674262:role/LabRole
+        TracingConfiguration:
+          Enabled: true
+        LoggingConfiguration:
+          Level: ALL
+          IncludeExecutionData: true
+          Destinations:
+            - CloudWatchLogsLogGroup:
+                LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+        Tags:
+          - Key: Environment
+            Value: ${sls:stage}
+          - Key: Resource
+            Value: StateMachine
+        DefinitionString:
+          Fn::Sub: |
+            {
+              "Comment": "KFC Order Processing Workflow con manejo de errores mejorado",
+              "StartAt": "InitializeOrder",
+              "States": {
+                "InitializeOrder": {
+                  "Type": "Pass",
+                  "Comment": "Inicializa variables del workflow",
+                  "Parameters": {
+                    "orderId.$": "$.orderId",
+                    "tenantId.$": "$.tenantId",
+                    "orderData.$": "$",
+                    "timestamp.$": "$$.State.EnteredTime",
+                    "executionId.$": "$$.Execution.Name"
+                  },
+                  "Next": "ParallelKitchenAndNotify"
+                },
+                "ParallelKitchenAndNotify": {
+                  "Type": "Parallel",
+                  "Comment": "Procesa cocina y envía notificación en paralelo",
+                  "Branches": [
+                    {
+                      "StartAt": "SendToKitchen",
+                      "States": {
+                        "SendToKitchen": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+                          "HeartbeatSeconds": 300,
+                          "Parameters": {
+                            "QueueUrl": "${KitchenQueue}",
+                            "MessageBody": {
+                              "taskToken.$": "$$.Task.Token",
+                              "orderId.$": "$.orderId",
+                              "tenantId.$": "$.tenantId",
+                              "stage": "kitchen",
+                              "executionId.$": "$.executionId",
+                              "timestamp.$": "$.timestamp"
+                            }
+                          },
+                          "Retry": [
+                            {
+                              "ErrorEquals": ["States.TaskFailed"],
+                              "IntervalSeconds": 2,
+                              "MaxAttempts": 3,
+                              "BackoffRate": 2.0
+                            },
+                            {
+                              "ErrorEquals": ["States.Timeout"],
+                              "IntervalSeconds": 1,
+                              "MaxAttempts": 2,
+                              "BackoffRate": 1.5
+                            }
+                          ],
+                          "Catch": [
+                            {
+                              "ErrorEquals": ["States.ALL"],
+                              "ResultPath": "$.error",
+                              "Next": "KitchenFailed"
+                            }
+                          ],
+                          "TimeoutSeconds": 600,
+                          "End": true
+                        },
+                        "KitchenFailed": {
+                          "Type": "Fail",
+                          "Error": "KitchenProcessingFailed",
+                          "Cause": "La cocina no pudo procesar el pedido después de reintentos"
+                        }
+                      }
+                    },
+                    {
+                      "StartAt": "PublishKitchenStarted",
+                      "States": {
+                        "PublishKitchenStarted": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::events:putEvents",
+                          "Parameters": {
+                            "Entries": [
+                              {
+                                "Source": "kfc.orders",
+                                "DetailType": "order.kitchen.started",
+                                "Detail": {
+                                  "orderId.$": "$.orderId",
+                                  "tenantId.$": "$.tenantId",
+                                  "stage": "kitchen",
+                                  "timestamp.$": "$.timestamp"
+                                },
+                                "EventBusName": "${OrdersEventBus}"
+                              }
+                            ]
+                          },
+                          "End": true
+                        }
+                      }
+                    }
+                  ],
+                  "Next": "ParallelPackagingAndNotify",
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"],
+                      "ResultPath": "$.workflowError",
+                      "Next": "HandleWorkflowFailure"
+                    }
+                  ]
+                },
+                "ParallelPackagingAndNotify": {
+                  "Type": "Parallel",
+                  "Comment": "Procesa empaque y envía notificación en paralelo",
+                  "Branches": [
+                    {
+                      "StartAt": "SendToPackaging",
+                      "States": {
+                        "SendToPackaging": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+                          "HeartbeatSeconds": 300,
+                          "Parameters": {
+                            "QueueUrl": "${PackagingQueue}",
+                            "MessageBody": {
+                              "taskToken.$": "$$.Task.Token",
+                              "orderId.$": "$[0].orderId",
+                              "tenantId.$": "$[0].tenantId",
+                              "stage": "packaging",
+                              "executionId.$": "$[0].executionId",
+                              "timestamp.$": "$$.State.EnteredTime"
+                            }
+                          },
+                          "Retry": [
+                            {
+                              "ErrorEquals": ["States.TaskFailed"],
+                              "IntervalSeconds": 2,
+                              "MaxAttempts": 3,
+                              "BackoffRate": 2.0
+                            }
+                          ],
+                          "Catch": [
+                            {
+                              "ErrorEquals": ["States.ALL"],
+                              "ResultPath": "$.error",
+                              "Next": "PackagingFailed"
+                            }
+                          ],
+                          "TimeoutSeconds": 600,
+                          "End": true
+                        },
+                        "PackagingFailed": {
+                          "Type": "Fail",
+                          "Error": "PackagingProcessingFailed",
+                          "Cause": "El empaque no pudo procesar el pedido"
+                        }
+                      }
+                    },
+                    {
+                      "StartAt": "PublishPackagingStarted",
+                      "States": {
+                        "PublishPackagingStarted": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::events:putEvents",
+                          "Parameters": {
+                            "Entries": [
+                              {
+                                "Source": "kfc.orders",
+                                "DetailType": "order.packaging.started",
+                                "Detail": {
+                                  "orderId.$": "$[0].orderId",
+                                  "tenantId.$": "$[0].tenantId",
+                                  "stage": "packaging",
+                                  "timestamp.$": "$$.State.EnteredTime"
+                                },
+                                "EventBusName": "${OrdersEventBus}"
+                              }
+                            ]
+                          },
+                          "End": true
+                        }
+                      }
+                    }
+                  ],
+                  "Next": "ParallelDeliveryAndNotify",
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"],
+                      "ResultPath": "$.workflowError",
+                      "Next": "HandleWorkflowFailure"
+                    }
+                  ]
+                },
+                "ParallelDeliveryAndNotify": {
+                  "Type": "Parallel",
+                  "Comment": "Procesa delivery y envía notificación en paralelo",
+                  "Branches": [
+                    {
+                      "StartAt": "SendToDelivery",
+                      "States": {
+                        "SendToDelivery": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+                          "HeartbeatSeconds": 300,
+                          "Parameters": {
+                            "QueueUrl": "${DeliveryQueue}",
+                            "MessageBody": {
+                              "taskToken.$": "$$.Task.Token",
+                              "orderId.$": "$[0].orderId",
+                              "tenantId.$": "$[0].tenantId",
+                              "stage": "delivery",
+                              "executionId.$": "$[0].executionId",
+                              "timestamp.$": "$$.State.EnteredTime"
+                            }
+                          },
+                          "Retry": [
+                            {
+                              "ErrorEquals": ["States.TaskFailed"],
+                              "IntervalSeconds": 2,
+                              "MaxAttempts": 3,
+                              "BackoffRate": 2.0
+                            }
+                          ],
+                          "Catch": [
+                            {
+                              "ErrorEquals": ["States.ALL"],
+                              "ResultPath": "$.error",
+                              "Next": "DeliveryFailed"
+                            }
+                          ],
+                          "TimeoutSeconds": 900,
+                          "End": true
+                        },
+                        "DeliveryFailed": {
+                          "Type": "Fail",
+                          "Error": "DeliveryProcessingFailed",
+                          "Cause": "El delivery no pudo completar la entrega"
+                        }
+                      }
+                    },
+                    {
+                      "StartAt": "PublishDeliveryStarted",
+                      "States": {
+                        "PublishDeliveryStarted": {
+                          "Type": "Task",
+                          "Resource": "arn:aws:states:::events:putEvents",
+                          "Parameters": {
+                            "Entries": [
+                              {
+                                "Source": "kfc.orders",
+                                "DetailType": "order.delivery.started",
+                                "Detail": {
+                                  "orderId.$": "$[0].orderId",
+                                  "tenantId.$": "$[0].tenantId",
+                                  "stage": "delivery",
+                                  "timestamp.$": "$$.State.EnteredTime"
+                                },
+                                "EventBusName": "${OrdersEventBus}"
+                              }
+                            ]
+                          },
+                          "End": true
+                        }
+                      }
+                    }
+                  ],
+                  "Next": "PublishOrderDelivered",
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"],
+                      "ResultPath": "$.workflowError",
+                      "Next": "HandleWorkflowFailure"
+                    }
+                  ]
+                },
+                "PublishOrderDelivered": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::events:putEvents",
+                  "Parameters": {
+                    "Entries": [
+                      {
+                        "Source": "kfc.orders",
+                        "DetailType": "order.delivered",
+                        "Detail": {
+                          "orderId.$": "$[0].orderId",
+                          "tenantId.$": "$[0].tenantId",
+                          "completedAt.$": "$$.State.EnteredTime",
+                          "executionId.$": "$[0].executionId"
+                        },
+                        "EventBusName": "${OrdersEventBus}"
+                      }
+                    ]
+                  },
+                  "Next": "WorkflowComplete"
+                },
+                "WorkflowComplete": {
+                  "Type": "Succeed"
+                },
+                "HandleWorkflowFailure": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::events:putEvents",
+                  "Parameters": {
+                    "Entries": [
+                      {
+                        "Source": "kfc.orders",
+                        "DetailType": "order.failed",
+                        "Detail": {
+                          "orderId.$": "$.orderId",
+                          "tenantId.$": "$.tenantId",
+                          "error.$": "$.workflowError",
+                          "failedAt.$": "$$.State.EnteredTime"
+                        },
+                        "EventBusName": "${OrdersEventBus}"
+                      }
+                    ]
+                  },
+                  "Next": "WorkflowFailed"
+                },
+                "WorkflowFailed": {
+                  "Type": "Fail",
+                  "Error": "OrderWorkflowFailed",
+                  "Cause": "El workflow del pedido falló en alguna etapa"
+                }
+              }
+            }
+    
+    # Log Group para Step Functions
+    StepFunctionsLogGroup:
+      Type: AWS::Logs::LogGroup
+      Properties:
+        LogGroupName: /aws/states/${self:service}-workflow-${sls:stage}-${self:custom.nameSuffix}
+        RetentionInDays: 14
+    
+    # ==================== CLOUDWATCH ALARMS ====================
+    # Alarma para errores en createOrder
+    CreateOrderErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: EnableAlarms
+      Properties:
+        AlarmName: ${self:service}-createOrder-errors-${sls:stage}
+        AlarmDescription: Alerta cuando createOrder tiene errores
+        MetricName: Errors
+        Namespace: AWS/Lambda
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 5
+        ComparisonOperator: GreaterThanThreshold
+        Dimensions:
+          - Name: FunctionName
+            Value: !Ref CreateOrderLambdaFunction
+        TreatMissingData: notBreaching
+        AlarmActions:
+          - !Ref OrderFailureAlarmTopic
+    
+    # Alarma para throttling en createOrder
+    CreateOrderThrottlesAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: EnableAlarms
+      Properties:
+        AlarmName: ${self:service}-createOrder-throttles-${sls:stage}
+        AlarmDescription: Alerta cuando createOrder está siendo throttled
+        MetricName: Throttles
+        Namespace: AWS/Lambda
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanThreshold
+        Dimensions:
+          - Name: FunctionName
+            Value: !Ref CreateOrderLambdaFunction
+        TreatMissingData: notBreaching
+        AlarmActions:
+          - !Ref OrderFailureAlarmTopic
+    
+    # Alarma para Step Functions con errores
+    StepFunctionsFailuresAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: EnableAlarms
+      Properties:
+        AlarmName: ${self:service}-stepfunctions-failures-${sls:stage}
+        AlarmDescription: Alerta cuando Step Functions fallan
+        MetricName: ExecutionsFailed
+        Namespace: AWS/States
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanThreshold
+        Dimensions:
+          - Name: StateMachineArn
+            Value: !Ref OrderWorkflow
+        TreatMissingData: notBreaching
+        AlarmActions:
+          - !Ref OrderFailureAlarmTopic
+    
+    # Alarma para mensajes en DLQ de Kitchen
+    KitchenDLQAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: EnableAlarms
+      Properties:
+        AlarmName: ${self:service}-kitchen-dlq-${sls:stage}
+        AlarmDescription: Alerta cuando hay mensajes en Kitchen DLQ
+        MetricName: ApproximateNumberOfMessagesVisible
+        Namespace: AWS/SQS
+        Statistic: Average
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt KitchenDLQ.QueueName
+        TreatMissingData: notBreaching
+        AlarmActions:
+          - !Ref OrderFailureAlarmTopic
+    
+    # Alarma para mensajes en DLQ de Packaging
+    PackagingDLQAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: EnableAlarms
+      Properties:
+        AlarmName: ${self:service}-packaging-dlq-${sls:stage}
+        AlarmDescription: Alerta cuando hay mensajes en Packaging DLQ
+        MetricName: ApproximateNumberOfMessagesVisible
+        Namespace: AWS/SQS
+        Statistic: Average
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt PackagingDLQ.QueueName
+        TreatMissingData: notBreaching
+        AlarmActions:
+          - !Ref OrderFailureAlarmTopic
+    
+    # Alarma para mensajes en DLQ de Delivery
+    DeliveryDLQAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Condition: EnableAlarms
+      Properties:
+        AlarmName: ${self:service}-delivery-dlq-${sls:stage}
+        AlarmDescription: Alerta cuando hay mensajes en Delivery DLQ
+        MetricName: ApproximateNumberOfMessagesVisible
+        Namespace: AWS/SQS
+        Statistic: Average
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        Dimensions:
+          - Name: QueueName
+            Value: !GetAtt DeliveryDLQ.QueueName
+        TreatMissingData: notBreaching
+        AlarmActions:
+          - !Ref OrderFailureAlarmTopic
+  
+  # Condiciones
+  Conditions:
+    EnableAlarms:
+      Fn::Equals:
+        - ${self:custom.alarmsEnabled.${sls:stage}}
+        - true
+  
+  # Outputs
+  Outputs:
+    HttpApiUrl:
+      Description: URL del HTTP API Gateway
+      Value:
+        Fn::Sub: "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+    
+    WebSocketApiUrl:
+      Description: URL del WebSocket API
+      Value:
+        Fn::Sub: "wss://${WebsocketsApi}.execute-api.${AWS::Region}.amazonaws.com/${sls:stage}"
+    
+    OrderWorkflowArn:
+      Description: ARN de la Step Function de órdenes
+      Value: !Ref OrderWorkflow
+    
+    EventBusName:
+      Description: Nombre del Event Bus
+      Value: !Ref OrdersEventBus
+    
+    MediaBucketName:
+      Description: Nombre del bucket S3 para media
+      Value: !Ref MediaBucket
+    
+    OrdersTableName:
+      Description: Nombre de la tabla de órdenes
+      Value: !Ref OrdersTable
+    
+    NotificationsTopicArn:
+      Description: ARN del SNS Topic para notificaciones
+      Value: !Ref OrderNotificationsTopic
+    
+    AlarmsTopicArn:
+      Description: ARN del SNS Topic para alarmas
+      Value: !Ref OrderFailureAlarmTopic
