@@ -1,9 +1,6 @@
 org: marcosotomac
 service: kfc-orders-cloud
 
-plugins:
-  - serverless-plugin-tracing
-
 provider:
   name: aws
   stage: ${opt:stage, 'dev'}
