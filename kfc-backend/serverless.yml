@@ -12,15 +12,16 @@ provider:
   timeout: 30
   
   # Logs estructurados con retention
-  logs:
-    restApi: true
-    httpApi: true
-  logRetentionInDays: 14
+  # Logs deshabilitados - requieren permisos especiales en AWS Academy
+  # logs:
+  #   restApi: true
+  #   httpApi: true
+  # logRetentionInDays: 14
   
-  # X-Ray tracing para todas las funciones
+  # X-Ray tracing solo para Lambda (API Gateway requiere permisos adicionales)
   tracing:
     lambda: true
-    apiGateway: true
+    # apiGateway: true  # Deshabilitado para AWS Academy
   
   # WebSocket API configuration
   websocketsApiName: ${self:service}-ws-${sls:stage}-${self:custom.nameSuffix}
@@ -384,7 +385,7 @@ custom:
   owner: marcos-soto
   
   # Sufijo opcional para evitar colisiones con stacks previos
-  nameSuffix: ${param:suffix, 'v6'}
+  nameSuffix: ${param:suffix, 'v7'}
   
   # Table names
   tenantsTableName: ${self:service}-tenants-${sls:stage}-${self:custom.nameSuffix}
@@ -932,12 +933,13 @@ resources:
         RoleArn: arn:aws:iam::367636225397:role/LabRole
         TracingConfiguration:
           Enabled: true
-        LoggingConfiguration:
-          Level: ALL
-          IncludeExecutionData: true
-          Destinations:
-            - CloudWatchLogsLogGroup:
-                LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+        # LoggingConfiguration deshabilitada - requiere permisos especiales en AWS Academy
+        # LoggingConfiguration:
+        #   Level: ALL
+        #   IncludeExecutionData: true
+        #   Destinations:
+        #     - CloudWatchLogsLogGroup:
+        #         LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
         Tags:
           - Key: Environment
             Value: ${sls:stage}
@@ -1264,12 +1266,12 @@ resources:
               }
             }
     
-    # Log Group para Step Functions
-    StepFunctionsLogGroup:
-      Type: AWS::Logs::LogGroup
-      Properties:
-        LogGroupName: /aws/states/${self:service}-workflow-${sls:stage}-${self:custom.nameSuffix}
-        RetentionInDays: 14
+    # Log Group para Step Functions - Deshabilitado para AWS Academy
+    # StepFunctionsLogGroup:
+    #   Type: AWS::Logs::LogGroup
+    #   Properties:
+    #     LogGroupName: /aws/states/${self:service}-workflow-${sls:stage}-${self:custom.nameSuffix}
+    #     RetentionInDays: 14
     
     # ==================== CLOUDWATCH ALARMS ====================
     # Alarma para errores en createOrder
