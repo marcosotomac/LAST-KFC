@@ -384,7 +384,7 @@ custom:
   owner: marcos-soto
   
   # Sufijo opcional para evitar colisiones con stacks previos
-  nameSuffix: ${param:suffix, 'v5'}
+  nameSuffix: ${param:suffix, 'v6'}
   
   # Table names
   tenantsTableName: ${self:service}-tenants-${sls:stage}-${self:custom.nameSuffix}
