@@ -1,8 +1,6 @@
 org: marcosotomac
 service: kfc-orders-cloud
 
-plugins:
-  - serverless-python-requirements
 
 provider:
   name: aws
@@ -392,7 +390,7 @@ custom:
     slim: true
     zip: true
     layer: false
-    dockerizePip: false
+    dockerizePip: true
     useStaticCache: false
     useDownloadCache: false
   
