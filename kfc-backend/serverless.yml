@@ -46,10 +46,7 @@ provider:
         - PUT
         - DELETE
       maxAge: 300
-    # Throttling para protección
-    throttle:
-      rateLimit: ${self:custom.apiThrottling.${sls:stage}.rateLimit}
-      burstLimit: ${self:custom.apiThrottling.${sls:stage}.burstLimit}
+
   
   # Variables de entorno compartidas por todas las funciones
   environment:
@@ -90,7 +87,7 @@ provider:
   
   # IAM Role - En producción se debería crear un role específico
   iam:
-    role: arn:aws:iam::967418674262:role/LabRole
+    role: arn:aws:iam::367636225397:role/LabRole
   
   # Tags globales para todos los recursos
   tags:
@@ -263,7 +260,6 @@ functions:
           arn:
             Fn::GetAtt: [KitchenQueue, Arn]
           batchSize: 1
-          maximumBatchingWindowInSeconds: 0
     environment:
       FUNCTION_NAME: kitchenWorker
       WORKER_TYPE: kitchen
@@ -282,7 +278,6 @@ functions:
           arn:
             Fn::GetAtt: [PackagingQueue, Arn]
           batchSize: 1
-          maximumBatchingWindowInSeconds: 0
     environment:
       FUNCTION_NAME: packagingWorker
       WORKER_TYPE: packaging
@@ -301,7 +296,6 @@ functions:
           arn:
             Fn::GetAtt: [DeliveryQueue, Arn]
           batchSize: 1
-          maximumBatchingWindowInSeconds: 0
     environment:
       FUNCTION_NAME: deliveryWorker
       WORKER_TYPE: delivery
@@ -699,7 +693,7 @@ resources:
         Targets:
           - Arn: !GetAtt OrderWorkflow.Arn
             Id: StartOrderWorkflow
-            RoleArn: arn:aws:iam::967418674262:role/LabRole
+            RoleArn: arn:aws:iam::367636225397:role/LabRole
             InputPath: "$.detail"
     
     KitchenStartedRule:
@@ -935,7 +929,7 @@ resources:
       Type: AWS::StepFunctions::StateMachine
       Properties:
         StateMachineName: ${self:service}-workflow-${sls:stage}-${self:custom.nameSuffix}
-        RoleArn: arn:aws:iam::967418674262:role/LabRole
+        RoleArn: arn:aws:iam::367636225397:role/LabRole
         TracingConfiguration:
           Enabled: true
         LoggingConfiguration:
