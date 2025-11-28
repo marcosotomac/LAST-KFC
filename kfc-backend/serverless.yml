@@ -389,7 +389,7 @@ custom:
   pythonRequirements:
     slim: true
     zip: true
-    layer: false
+    layer: true
     dockerizePip: false  # Deshabilitado - usar pip local
     useStaticCache: false
     useDownloadCache: false
