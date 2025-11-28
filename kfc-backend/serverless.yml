@@ -395,7 +395,7 @@ custom:
     useDownloadCache: false
   
   # Sufijo opcional para evitar colisiones con stacks previos
-  nameSuffix: ${param:suffix, 'v8'}
+  nameSuffix: ${param:suffix, 'v7'}
   
   # Table names
   tenantsTableName: ${self:service}-tenants-${sls:stage}-${self:custom.nameSuffix}
