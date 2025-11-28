@@ -1,6 +1,9 @@
 org: marcosotomac
 service: kfc-orders-cloud
 
+plugins:
+  - serverless-python-requirements
+
 
 provider:
   name: aws
