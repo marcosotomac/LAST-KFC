@@ -89,7 +89,7 @@ provider:
   
   # IAM Role - En producción se debería crear un role específico
   iam:
-    role: arn:aws:iam::367636225397:role/LabRole
+    role: arn:aws:iam::181506757685:role/LabRole
   
   # Tags globales para todos los recursos
   tags:
@@ -704,7 +704,7 @@ resources:
         Targets:
           - Arn: !GetAtt OrderWorkflow.Arn
             Id: StartOrderWorkflow
-            RoleArn: arn:aws:iam::367636225397:role/LabRole
+            RoleArn: arn:aws:iam::181506757685:role/LabRole
             InputPath: "$.detail"
     
     KitchenStartedRule:
@@ -940,7 +940,7 @@ resources:
       Type: AWS::StepFunctions::StateMachine
       Properties:
         StateMachineName: ${self:service}-workflow-${sls:stage}-${self:custom.nameSuffix}
-        RoleArn: arn:aws:iam::367636225397:role/LabRole
+        RoleArn: arn:aws:iam::181506757685:role/LabRole
         TracingConfiguration:
           Enabled: true
         # LoggingConfiguration deshabilitada - requiere permisos especiales en AWS Academy
