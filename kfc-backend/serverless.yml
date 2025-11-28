@@ -7,7 +7,7 @@ provider:
   stage: ${opt:stage, 'dev'}
   region: ${opt:region, 'us-east-1'}
   stackName: ${self:service}-${sls:stage}-${self:custom.nameSuffix}
-  runtime: python3.9  # Temporalmente 3.9 para deployment local, Docker usará 3.11
+  runtime: python3.11  # Temporalmente 3.9 para deployment local, Docker usará 3.11
   # Configuración de memoria y timeout base - se puede override por función
   memorySize: 1024
   timeout: 30
